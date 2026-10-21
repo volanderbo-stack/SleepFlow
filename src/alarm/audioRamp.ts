@@ -93,72 +93,100 @@ const PATTERNS: Record<AlarmSoundId, Pattern> = {
   },
 };
 
+/** Скільки мелодії планувати наперед для дедлайну — грає, навіть якщо сторінку «заморожено». */
+const PRESCHEDULE_SEC = 15 * 60;
+
+interface Voice {
+  gain: GainNode;
+  pattern: Pattern;
+  /** Час старту в годиннику AudioContext. */
+  t0: number;
+  nextBarAt: number;
+  bar: number;
+}
+
 /**
  * Будильник на Web Audio (без зовнішніх файлів). AudioContext створюється в prime()
  * під час натискання «Почати сон» — інакше браузер не дасть грати звук уранці без жесту.
+ *
+ * scheduleAt() заздалегідь кладе 15 хв мелодії в аудіограф на час дедлайну: ноти грає аудіопотік,
+ * тож будильник пролунає, навіть якщо з вимкненим екраном Chrome призупинив JavaScript.
  */
 export class AlarmPlayer {
   private ctx: AudioContext | null = null;
-  private master: GainNode | null = null;
+  private voice: Voice | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
-  private nextBarAt = 0;
-  private bar = 0;
   private stopTimer: ReturnType<typeof setTimeout> | null = null;
 
   prime() {
     if (this.ctx) return;
     this.ctx = new AudioContext();
-    this.master = this.ctx.createGain();
-    this.master.gain.value = 0;
-    this.master.connect(this.ctx.destination);
     void this.ctx.resume().catch(() => undefined);
   }
 
+  /** Чи звучить мелодія зараз (а не лише запланована). */
   get playing(): boolean {
-    return this.timer !== null;
+    return !!this.voice && !!this.ctx && this.voice.t0 <= this.ctx.currentTime;
   }
 
-  /** Починає мелодію з наростанням гучності за rampSec. durationSec — автозупинка (для прев'ю). */
+  /** Планує мелодію на момент atMs (час Date.now()). Попередня запланована/поточна — скасовується. */
+  scheduleAt(sound: AlarmSoundId, atMs: number, rampSec = RAMP_SEC) {
+    this.prime();
+    const ctx = this.ctx!;
+    const t0 = ctx.currentTime + Math.max(0.05, (atMs - Date.now()) / 1000);
+    this.begin(sound, t0, rampSec, t0 + PRESCHEDULE_SEC);
+  }
+
+  /**
+   * Грає зараз з наростанням за rampSec. Якщо запланована мелодія вже звучить — не перезапускає її
+   * (інакше гучність впала б до нуля). durationSec — автозупинка (для прев'ю).
+   */
   start(sound: AlarmSoundId, rampSec = RAMP_SEC, durationSec?: number) {
     this.prime();
     const ctx = this.ctx!;
-    const master = this.master!;
     void ctx.resume().catch(() => undefined);
-    this.halt();
-    const pattern = PATTERNS[sound] ?? PATTERNS.dawn;
-    const t0 = ctx.currentTime + 0.05;
-    master.gain.cancelScheduledValues(t0);
-    master.gain.setValueAtTime(0.001, t0);
-    master.gain.linearRampToValueAtTime(1, t0 + rampSec);
-    this.nextBarAt = t0;
-    this.bar = 0;
-    const schedule = () => {
-      // Плануємо на 2 с наперед — таймер може трохи запізнюватися.
-      while (this.nextBarAt < ctx.currentTime + 2) {
-        pattern.play(ctx, master, this.nextBarAt, this.bar++);
-        this.nextBarAt += pattern.bar;
-      }
-    };
-    schedule();
-    this.timer = setInterval(schedule, 500);
+    if (!this.playing) this.begin(sound, ctx.currentTime + 0.05, rampSec, 0);
     if (durationSec) this.stopTimer = setTimeout(() => this.stop(), durationSec * 1000);
   }
 
   stop() {
-    if (this.ctx && this.master) {
-      const t = this.ctx.currentTime;
-      this.master.gain.cancelScheduledValues(t);
-      this.master.gain.setValueAtTime(this.master.gain.value, t);
-      this.master.gain.linearRampToValueAtTime(0, t + 0.3);
-    }
     this.halt();
+    const v = this.voice;
+    this.voice = null;
+    if (v && this.ctx) {
+      const t = this.ctx.currentTime;
+      v.gain.gain.cancelScheduledValues(t);
+      v.gain.gain.setValueAtTime(t >= v.t0 ? v.gain.gain.value : 0, t);
+      v.gain.gain.linearRampToValueAtTime(0, t + 0.3);
+      setTimeout(() => v.gain.disconnect(), 400);
+    }
   }
 
   async close() {
     this.stop();
     await this.ctx?.close().catch(() => undefined);
     this.ctx = null;
-    this.master = null;
+  }
+
+  private begin(sound: AlarmSoundId, t0: number, rampSec: number, scheduleUntil: number) {
+    this.stop();
+    const ctx = this.ctx!;
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0, ctx.currentTime);
+    gain.gain.setValueAtTime(0.001, t0);
+    gain.gain.linearRampToValueAtTime(1, t0 + rampSec);
+    gain.connect(ctx.destination);
+    const v: Voice = { gain, pattern: PATTERNS[sound] ?? PATTERNS.dawn, t0, nextBarAt: t0, bar: 0 };
+    this.voice = v;
+    const schedule = (until: number) => {
+      while (v.nextBarAt < until) {
+        v.pattern.play(ctx, gain, v.nextBarAt, v.bar++);
+        v.nextBarAt += v.pattern.bar;
+      }
+    };
+    schedule(Math.max(scheduleUntil, ctx.currentTime + 2));
+    // Далі дописуємо по 2 с наперед, поки сторінка жива.
+    this.timer = setInterval(() => schedule(ctx.currentTime + 2), 500);
   }
 
   private halt() {

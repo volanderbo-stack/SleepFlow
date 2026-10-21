@@ -38,6 +38,8 @@ export interface Night {
   epochs: Epoch[];
   stages: StageSegment[];
   gaps?: DataGap[];
+  /** Скільки хвилин сесія працювала з вимкненим екраном (застосунок у фоні). */
+  screenOffMin?: number;
   sleepOnsetMin: number;
   totalSleepMin: number;
   awakenings: number;

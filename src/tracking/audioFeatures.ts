@@ -26,13 +26,22 @@ export function rmsDb(samples: Float32Array): number {
  * binHz = sampleRate / fftSize.
  */
 export function bandRatios(spectrumDb: Float32Array, binHz: number): { lowRatio: number; speechRatio: number } {
+  return ratios(spectrumDb.length, binHz, (i) => Math.pow(10, spectrumDb[i] / 10));
+}
+
+/** Те саме для спектра потужності (з fft.ts). */
+export function bandRatiosFromPower(power: Float32Array, binHz: number): { lowRatio: number; speechRatio: number } {
+  return ratios(power.length, binHz, (i) => power[i]);
+}
+
+function ratios(bins: number, binHz: number, powerAt: (i: number) => number): { lowRatio: number; speechRatio: number } {
   let total = 0;
   let low = 0;
   let speech = 0;
-  for (let i = 0; i < spectrumDb.length; i++) {
+  for (let i = 0; i < bins; i++) {
     const f = i * binHz;
     if (f < BAND_MIN || f > BAND_MAX) continue;
-    const p = Math.pow(10, spectrumDb[i] / 10);
+    const p = powerAt(i);
     total += p;
     if (f >= 100 && f <= 1000) low += p;
     if (f >= 300 && f <= 3000) speech += p;

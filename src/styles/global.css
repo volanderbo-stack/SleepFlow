@@ -842,6 +842,12 @@ p {
   font-size: 13px;
   text-align: center;
 }
+.night__hint--accent {
+  color: var(--accent-2);
+}
+.night.is-bright .night__hint--accent {
+  opacity: 0.9;
+}
 .night__warn {
   max-width: 320px;
   padding: 10px 14px;

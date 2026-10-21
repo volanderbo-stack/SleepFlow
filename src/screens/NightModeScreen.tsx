@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { fmtTime } from '../app/format';
 import { isDebug, useNow } from '../app/hooks';
+import { isAndroid, isIOS } from '../app/platform';
 import { useApp } from '../app/store';
 import { DebugPanel } from '../components/DebugPanel';
 import { minutesLeft, useSounds } from '../components/SoundsSheet';
@@ -96,6 +97,8 @@ export function NightModeScreen() {
   const [shift, setShift] = useState({ x: 0, y: 0 });
   const debug = isDebug();
   const bright = debug || now < brightUntil;
+  const ios = isIOS();
+  const android = isAndroid();
 
   // Зсуваємо годинник щохвилини, щоб не «випалити» екран за ніч.
   useEffect(() => {
@@ -106,8 +109,9 @@ export function NightModeScreen() {
   if (t.ringing) return <RingScreen />;
 
   const warnings: string[] = [];
-  if (t.wakeLock === 'unsupported') warnings.push(uk.night.wakeLockUnsupported);
-  else if (t.wakeLock === 'off' && t.phase === 'running') warnings.push(uk.night.wakeLockLost);
+  // На Android запис триває й з вимкненим екраном, тож втрата Wake Lock — не проблема. На iOS — проблема.
+  if (ios && t.wakeLock === 'unsupported') warnings.push(uk.night.wakeLockUnsupported);
+  else if (ios && t.wakeLock === 'off' && t.phase === 'running') warnings.push(uk.night.wakeLockLost);
   if (t.charging === false) warnings.push(uk.night.notCharging);
 
   const micActivity = Math.min(1, Math.max(0, (t.level - t.baseline) / 20));
@@ -144,6 +148,8 @@ export function NightModeScreen() {
         </div>
         {!snoozed && t.calibrating && t.phase === 'running' && <div className="night__hint">{uk.night.calibrating}</div>}
         {!snoozed && bright && <div className="night__hint">{uk.night.placeHint}</div>}
+        {!snoozed && bright && !ios && <div className="night__hint night__hint--accent">{uk.night.screenOffHint}</div>}
+        {!snoozed && bright && android && <div className="night__hint">{uk.night.batteryHint}</div>}
         {!snoozed &&
           warnings.map((w) => (
             <div key={w} className="night__warn">

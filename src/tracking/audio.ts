@@ -1,4 +1,5 @@
-import { computeFrame, type AudioFrame } from './audioFeatures';
+import workletUrl from './frameWorklet.ts?worker&url';
+import type { FromWorklet, ToWorklet } from './pipeline';
 
 export class MicUnavailableError extends Error {}
 
@@ -15,29 +16,34 @@ export function openMicrophone(): Promise<MediaStream> {
 }
 
 /**
- * Аналізує потік мікрофона кадрами по ~100 мс. Звук не записується —
- * назовні йдуть лише рівень і частки спектра.
+ * Мікрофон → AudioWorklet з усім аналізом. Звук не записується —
+ * назад приходять лише ознаки кадрів, готові епохи й події (хропіння, дедлайн будильника).
  */
-export class AudioAnalyzer {
+export class WorkletTracker {
   private ctx: AudioContext | null = null;
-  private analyser: AnalyserNode | null = null;
   private source: MediaStreamAudioSourceNode | null = null;
-  private timeData = new Float32Array(2048);
-  private spectrum = new Float32Array(1024);
+  private node: AudioWorkletNode | null = null;
+  private sink: GainNode | null = null;
 
-  /** Викликати після дії користувача (вимога автозапуску аудіо). */
-  start(stream: MediaStream) {
-    this.ctx = new AudioContext();
-    this.source = this.ctx.createMediaStreamSource(stream);
-    this.analyser = this.ctx.createAnalyser();
-    this.analyser.fftSize = 2048;
-    this.analyser.smoothingTimeConstant = 0;
-    this.timeData = new Float32Array(this.analyser.fftSize);
-    this.spectrum = new Float32Array(this.analyser.frequencyBinCount);
-    this.source.connect(this.analyser);
+  async start(stream: MediaStream, onMessage: (m: FromWorklet) => void) {
+    const ctx = new AudioContext();
+    this.ctx = ctx;
+    await ctx.audioWorklet.addModule(workletUrl);
+    this.source = ctx.createMediaStreamSource(stream);
+    this.node = new AudioWorkletNode(ctx, 'sleep-frame-processor', { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1] });
+    this.node.port.onmessage = (e: MessageEvent<FromWorklet>) => onMessage(e.data);
+    // Вихід з нульовою гучністю в динамік — щоб браузер гарантовано «тягнув» граф і викликав process().
+    this.sink = ctx.createGain();
+    this.sink.gain.value = 0;
+    this.source.connect(this.node).connect(this.sink).connect(ctx.destination);
+    await ctx.resume().catch(() => undefined);
   }
 
-  /** AudioContext міг призупинитися (згортання, дзвінок) — відновлюємо. */
+  post(m: ToWorklet) {
+    this.node?.port.postMessage(m);
+  }
+
+  /** AudioContext міг призупинитися (дзвінок, інший застосунок) — відновлюємо. */
   async resume() {
     if (this.ctx?.state === 'suspended') await this.ctx.resume().catch(() => undefined);
   }
@@ -46,18 +52,14 @@ export class AudioAnalyzer {
     return this.ctx?.state === 'running';
   }
 
-  read(t: number): AudioFrame | null {
-    if (!this.analyser || !this.ctx) return null;
-    this.analyser.getFloatTimeDomainData(this.timeData);
-    this.analyser.getFloatFrequencyData(this.spectrum);
-    return computeFrame(t, this.timeData, this.spectrum, this.ctx.sampleRate / this.analyser.fftSize);
-  }
-
   async stop() {
     this.source?.disconnect();
+    this.node?.disconnect();
+    if (this.node) this.node.port.onmessage = null;
     await this.ctx?.close().catch(() => undefined);
     this.ctx = null;
-    this.analyser = null;
     this.source = null;
+    this.node = null;
+    this.sink = null;
   }
 }

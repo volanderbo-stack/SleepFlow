@@ -142,6 +142,7 @@ export function NightDetailScreen({ id }: { id: number }) {
           ))}
         </div>
         {night.gaps && night.gaps.length > 0 && <p className="hint warn">{uk.journal.gaps(night.gaps.length)}</p>}
+        {!!night.screenOffMin && <p className="hint">{uk.journal.screenOff(fmtDuration(night.screenOffMin))}</p>}
       </section>
 
       <section className="card">

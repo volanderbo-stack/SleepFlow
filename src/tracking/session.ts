@@ -4,19 +4,15 @@ import { finalizeNight, type RawNight } from '../analysis/finalize';
 import { classifyEpochs, segmentsFromEpochs } from '../analysis/staging';
 import * as repo from '../db/repo';
 import { EPOCH_MS, type AlarmSoundId, type DataGap, type Epoch, type Stage, type TagId } from '../db/types';
-import { AudioAnalyzer, openMicrophone } from './audio';
+import { openMicrophone, WorkletTracker } from './audio';
 import type { AudioFrame } from './audioFeatures';
 import { CLIP_MS, ClipRecorder } from './clips';
-import { EpochAggregator } from './epochs';
 import { MotionTracker, requestMotionPermission } from './motion';
-import { SnoreDetector } from './snore';
+import type { FromWorklet } from './pipeline';
 import { WakeLockKeeper, type WakeLockState } from './wakeLock';
 
-const FRAME_MS = 100;
-/** Пауза між кадрами, довша за це, вважається розривом (таймер заморожено, вкладку згорнуто). */
-const GAP_DETECT_MS = 5_000;
 /** Розриви коротші за це не показуємо в журналі. */
-const MIN_GAP_MS = 30_000;
+const MIN_GAP_MS = 60_000;
 /** Зберігаємо чернетку ночі кожні N епох — дані не загубляться, якщо браузер закриється. */
 const SAVE_EVERY_EPOCHS = 10;
 /** Сесії коротші за 2 хв (випадковий старт) не зберігаються. */
@@ -24,6 +20,8 @@ const MIN_EPOCHS = 4;
 const MAX_CLIPS = 20;
 const CLIP_SPACING_MS = 3 * 60_000;
 const STATUS_INTERVAL_MS = 500;
+/** Скільки чекати на останню епоху від AudioWorklet під час зупинки. */
+const STOP_TIMEOUT_MS = 2_000;
 export const SNOOZE_MIN = 9;
 const VIBRATE_PATTERN = [600, 400, 600, 1400];
 
@@ -51,6 +49,7 @@ export interface SessionStatus {
   wakeReason: WakeReason | null;
   /** Час повторного сигналу після «Відкласти». */
   snoozeUntil: number | null;
+  screenOffMin: number;
 }
 
 export interface LiveFrame extends AudioFrame {
@@ -88,15 +87,27 @@ const IDLE: SessionStatus = {
   ringing: false,
   wakeReason: null,
   snoozeUntil: null,
+  screenOffMin: 0,
 };
 
 interface BatteryLike extends EventTarget {
   charging: boolean;
 }
 
+/** Розриви в даних = пропуски між епохами (аудіопотік зупинявся або мікрофон глушився). */
+export function gapsFromEpochs(epochs: Epoch[], minGapMs = MIN_GAP_MS): DataGap[] {
+  const out: DataGap[] = [];
+  for (let i = 1; i < epochs.length; i++) {
+    const from = epochs[i - 1].t + EPOCH_MS;
+    if (epochs[i].t - from >= minGapMs) out.push({ from, to: epochs[i].t });
+  }
+  return out;
+}
+
 /**
- * Нічна сесія: мікрофон + акселерометр → епохи → гіпнограма, з періодичним збереженням,
- * і розумний будильник. Коли будильник дзвонить, запис зупиняється — момент пробудження зафіксовано.
+ * Нічна сесія. Аналіз звуку живе в AudioWorklet (аудіопотік), тож на Android він працює
+ * і з вимкненим екраном; основний потік лише зберігає епохи, вирішує, коли будити, і малює UI.
+ * Мелодія на час будильника заздалегідь запланована в аудіографі — прозвучить, навіть якщо JS призупинено.
  */
 export class SleepSession {
   private status: SessionStatus = { ...IDLE };
@@ -106,20 +117,16 @@ export class SleepSession {
 
   private opts: StartOptions | null = null;
   private stream: MediaStream | null = null;
-  private audio = new AudioAnalyzer();
+  private tracker = new WorkletTracker();
   private motion = new MotionTracker();
   private wakeLock = new WakeLockKeeper();
   private alarm = new AlarmPlayer();
   private clipRecorder: ClipRecorder | null = null;
-  private aggregator: EpochAggregator | null = null;
-  private detector = new SnoreDetector();
   private timer: ReturnType<typeof setInterval> | null = null;
   private vibrateTimer: ReturnType<typeof setInterval> | null = null;
   private epochs: Epoch[] = [];
   private stages: Stage[] = [];
-  private gaps: DataGap[] = [];
-  private hiddenSince: number | null = null;
-  private lastTick = 0;
+  private motionBatch: [number, number][] = [];
   private accelAcc = 0;
   private motionGranted = false;
   private tracking = false;
@@ -130,6 +137,9 @@ export class SleepSession {
   private lastClipAt = 0;
   private snoringNow = false;
   private wokeAt: number | null = null;
+  private hiddenSince: number | null = null;
+  private hiddenMs = 0;
+  private stopResolve: ((epochs: Epoch[]) => void) | null = null;
   private battery: BatteryLike | null = null;
 
   getStatus(): SessionStatus {
@@ -175,23 +185,30 @@ export class SleepSession {
     const startedAt = Date.now();
     this.epochs = [];
     this.stages = [];
-    this.gaps = [];
-    this.hiddenSince = null;
-    this.lastTick = 0;
+    this.motionBatch = [];
     this.accelAcc = 0;
     this.epochsSinceSave = 0;
     this.lastClipAt = 0;
     this.snoringNow = false;
     this.wokeAt = null;
-    this.aggregator = new EpochAggregator(startedAt);
-    this.detector = new SnoreDetector();
+    this.hiddenSince = document.visibilityState === 'hidden' ? startedAt : null;
+    this.hiddenMs = 0;
     this.clipRecorder = opts.saveClips ? new ClipRecorder(this.stream) : null;
 
-    this.audio.start(this.stream);
-    await this.audio.resume();
+    try {
+      await this.tracker.start(this.stream, this.onWorklet);
+    } catch (e) {
+      this.stream.getTracks().forEach((t) => t.stop());
+      this.setStatus({ ...IDLE }, true);
+      throw e;
+    }
+    this.tracker.post({ type: 'start', startedAt });
+    this.tracker.post({ type: 'alarm', at: opts.alarmTarget });
+    if (opts.alarmTarget) this.alarm.scheduleAt(opts.alarmSound, opts.alarmTarget);
+
     if (this.motionGranted) {
       this.motion.start((t, d) => {
-        this.aggregator?.addMotion(t, d);
+        this.motionBatch.push([t, d]);
         this.accelAcc += d;
       });
     }
@@ -205,7 +222,8 @@ export class SleepSession {
     this.otherStarts = (await repo.listNights()).map((n) => n.startedAt);
     const nightId = await repo.addNight(finalizeNight(this.raw(startedAt, startedAt, false), this.otherStarts, opts.goalMin));
 
-    this.timer = setInterval(this.tick, FRAME_MS);
+    // Запасний таймер: повтор після «Відкласти» і дедлайн, якщо аудіопотік зупинився.
+    this.timer = setInterval(this.tick, 1000);
     this.setStatus(
       {
         phase: 'running',
@@ -224,13 +242,18 @@ export class SleepSession {
   snooze() {
     if (!this.status.ringing) return;
     this.stopRinging();
-    this.setStatus({ ringing: false, snoozeUntil: Date.now() + SNOOZE_MIN * 60_000 }, true);
+    const at = Date.now() + SNOOZE_MIN * 60_000;
+    this.alarm.scheduleAt(this.opts?.alarmSound ?? 'dawn', at);
+    this.setStatus({ ringing: false, snoozeUntil: at }, true);
   }
 
   /** Debug: переносить будильник на найближчий час, щоб перевірити його без очікування до ранку. */
   debugSetAlarm(inMs: number, wakeWindowMin: number) {
     if (this.status.phase !== 'running') return;
-    this.setStatus({ alarmTarget: Date.now() + inMs, wakeWindowMin, snoozeUntil: null }, true);
+    const at = Date.now() + inMs;
+    this.tracker.post({ type: 'alarm', at });
+    this.alarm.scheduleAt(this.opts?.alarmSound ?? 'dawn', at);
+    this.setStatus({ alarmTarget: at, wakeWindowMin, snoozeUntil: null }, true);
   }
 
   debugRingNow() {
@@ -245,7 +268,9 @@ export class SleepSession {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
     this.stopRinging();
+    this.alarm.stop();
     await this.stopTracking(now);
+    this.closeHidden(now);
     document.removeEventListener('visibilitychange', this.onVisibility);
     window.removeEventListener('pagehide', this.onPageHide);
     await this.wakeLock.release();
@@ -266,58 +291,78 @@ export class SleepSession {
     return result;
   }
 
+  private onWorklet = (m: FromWorklet) => {
+    const now = Date.now();
+    switch (m.type) {
+      case 'frame': {
+        this.snoringNow = m.snoring;
+        if (this.motionBatch.length) {
+          this.tracker.post({ type: 'motion', samples: this.motionBatch });
+          this.motionBatch = [];
+        }
+        if (document.visibilityState === 'visible') {
+          const live: LiveFrame = { ...m.frame, accel: this.accelAcc, snoring: m.snoring, talking: m.talking };
+          this.frameListeners.forEach((fn) => fn(live));
+        }
+        this.accelAcc = 0;
+        this.setStatus({
+          calibrating: m.calibrating,
+          baseline: m.baseline,
+          level: m.frame.db,
+          snoring: m.snoring,
+          motion: !this.motionGranted ? 'off' : this.motion.receiving ? 'on' : 'waiting',
+        });
+        break;
+      }
+      case 'snoreStart':
+        this.maybeRecordClip(now);
+        break;
+      case 'epochs':
+        this.addEpochs(m.epochs);
+        if (this.epochsSinceSave >= SAVE_EVERY_EPOCHS) void this.save(now, false);
+        this.checkAlarm(now, true);
+        break;
+      case 'deadline':
+        if (this.status.alarmTarget !== null && !this.status.ringing) void this.ring(now, 'deadline');
+        break;
+      case 'stopped':
+        this.addEpochs(m.epochs);
+        this.stopResolve?.(m.epochs);
+        this.stopResolve = null;
+        break;
+    }
+  };
+
+  private addEpochs(epochs: Epoch[]) {
+    if (!epochs.length) return;
+    this.epochs.push(...epochs);
+    this.stages = classifyEpochs(this.epochs);
+    this.epochsSinceSave += epochs.length;
+    this.setStatus(
+      {
+        epochs: this.epochs.length,
+        gaps: gapsFromEpochs(this.epochs).length,
+        lastStage: this.stages[this.stages.length - 1] ?? null,
+        screenOffMin: this.screenOffMin(Date.now()),
+      },
+      true,
+    );
+  }
+
   private tick = () => {
     const now = Date.now();
-    if (this.lastTick && now - this.lastTick > GAP_DETECT_MS && this.tracking) this.addGap(this.lastTick, now);
-    this.lastTick = now;
-
     if (this.status.ringing) return;
     if (this.status.snoozeUntil !== null) {
       if (now >= this.status.snoozeUntil) void this.ring(now, 'deadline');
       return;
     }
-    if (!this.tracking || document.visibilityState === 'hidden' || !this.aggregator) {
-      this.checkAlarm(now, false);
-      return;
-    }
-    if (!this.audio.running) void this.audio.resume();
-
-    const f = this.audio.read(now);
-    if (!f) return;
-    this.detector.baseline = this.aggregator.baseline;
-    const st = this.detector.feed(f);
-    this.snoringNow = st.snoring;
-    this.aggregator.addAudio(f, st.snoring, st.talking);
-    if (st.episodeStarted) this.maybeRecordClip(now);
-
-    const live: LiveFrame = { ...f, accel: this.accelAcc, snoring: st.snoring, talking: st.talking };
-    this.accelAcc = 0;
-    this.frameListeners.forEach((fn) => fn(live));
-
-    const done = this.aggregator.flush(now);
-    if (done.length) {
-      this.epochs.push(...done);
-      this.stages = classifyEpochs(this.epochs);
-      this.epochsSinceSave += done.length;
-      if (this.epochsSinceSave >= SAVE_EVERY_EPOCHS) void this.save(now, false);
-    }
-    this.checkAlarm(now, done.length > 0);
-
-    this.setStatus({
-      epochs: this.epochs.length,
-      calibrating: this.aggregator.calibrating,
-      baseline: this.aggregator.baseline,
-      level: f.db,
-      snoring: st.snoring,
-      lastStage: this.stages[this.stages.length - 1] ?? null,
-      motion: !this.motionGranted ? 'off' : this.motion.receiving ? 'on' : 'waiting',
-    });
+    this.checkAlarm(now, false);
   };
 
-  /** Перевіряє дедлайн щотику, а розумне пробудження — на кожній новій епосі. */
+  /** Дедлайн перевіряємо завжди, розумне пробудження — на кожній новій епосі. */
   private checkAlarm(now: number, freshEpoch: boolean) {
-    const { alarmTarget, wakeWindowMin } = this.status;
-    if (alarmTarget === null) return;
+    const { alarmTarget, wakeWindowMin, ringing } = this.status;
+    if (alarmTarget === null || ringing) return;
     if (now < alarmTarget && !freshEpoch) return;
     const d = decideWake({ now, alarmTarget, wakeWindowMin, epochs: this.epochs, stages: this.stages });
     if (d.wake && d.reason) void this.ring(now, d.reason);
@@ -327,14 +372,15 @@ export class SleepSession {
     if (this.status.ringing) return;
     this.wokeAt ??= now;
     this.setStatus({ ringing: true, wakeReason: this.status.wakeReason ?? reason, snoozeUntil: null }, true);
-    // Мікрофон вимикаємо до старту мелодії: на iOS активний запис приглушує динамік.
-    await this.stopTracking(now);
+    // Якщо запланована мелодія вже звучить — start() її не перезапускає.
     this.alarm.start(this.opts?.alarmSound ?? 'dawn');
     if ('vibrate' in navigator) {
       const vib = () => navigator.vibrate(VIBRATE_PATTERN);
       vib();
       this.vibrateTimer = setInterval(vib, VIBRATE_PATTERN.reduce((a, b) => a + b, 0));
     }
+    // Мікрофон вимикаємо: момент пробудження зафіксовано, а на iOS активний запис приглушує динамік.
+    await this.stopTracking(now);
     void this.save(now, false);
   }
 
@@ -345,18 +391,23 @@ export class SleepSession {
     if ('vibrate' in navigator) navigator.vibrate(0);
   }
 
-  /** Зупиняє мікрофон і датчики, закриваючи останню незавершену епоху. */
+  /** Зупиняє мікрофон і датчики, забираючи з AudioWorklet останню незавершену епоху. */
   private async stopTracking(now: number) {
     if (!this.tracking) return;
     this.tracking = false;
-    if (this.hiddenSince !== null) this.addGap(this.hiddenSince, now);
-    this.hiddenSince = null;
-    if (this.aggregator) {
-      this.epochs.push(...this.aggregator.flush(now + EPOCH_MS));
-      this.stages = classifyEpochs(this.epochs);
-    }
+    await new Promise<void>((resolve) => {
+      const timeout = setTimeout(() => {
+        this.stopResolve = null;
+        resolve();
+      }, STOP_TIMEOUT_MS);
+      this.stopResolve = () => {
+        clearTimeout(timeout);
+        resolve();
+      };
+      this.tracker.post({ type: 'stop', at: now });
+    });
     this.motion.stop();
-    await this.audio.stop();
+    await this.tracker.stop();
     await this.clipPromise;
     this.stream?.getTracks().forEach((t) => t.stop());
     this.stream = null;
@@ -376,6 +427,17 @@ export class SleepSession {
     });
   }
 
+  private screenOffMin(now: number): number {
+    const ms = this.hiddenMs + (this.hiddenSince !== null ? now - this.hiddenSince : 0);
+    return Math.round(ms / 60_000);
+  }
+
+  private closeHidden(now: number) {
+    if (this.hiddenSince === null) return;
+    this.hiddenMs += now - this.hiddenSince;
+    this.hiddenSince = null;
+  }
+
   private raw(startedAt: number, endedAt: number, final: boolean): RawNight {
     const o = this.opts!;
     return {
@@ -386,7 +448,8 @@ export class SleepSession {
       actualWakeAt: final || this.wokeAt ? (this.wokeAt ?? endedAt) : null,
       epochs: this.epochs,
       stages: segmentsFromEpochs(this.epochs, this.stages.length === this.epochs.length ? this.stages : classifyEpochs(this.epochs)),
-      gaps: this.gaps.filter((g) => g.to - g.from >= MIN_GAP_MS),
+      gaps: gapsFromEpochs(this.epochs),
+      screenOffMin: this.screenOffMin(endedAt),
       tags: o.tags,
       note: '',
       isDemo: false,
@@ -404,24 +467,17 @@ export class SleepSession {
     return this.saveChain;
   }
 
-  private addGap(from: number, to: number) {
-    const last = this.gaps[this.gaps.length - 1];
-    if (last && from <= last.to) last.to = Math.max(last.to, to);
-    else this.gaps.push({ from, to });
-    this.setStatus({ gaps: this.gaps.filter((g) => g.to - g.from >= MIN_GAP_MS).length }, true);
-  }
-
   private onVisibility = () => {
     const now = Date.now();
-    if (!this.tracking) return;
     if (document.visibilityState === 'hidden') {
-      this.hiddenSince = now;
+      this.hiddenSince ??= now;
       void this.save(now, false);
-    } else if (this.hiddenSince !== null) {
-      this.addGap(this.hiddenSince, now);
-      this.hiddenSince = null;
-      this.lastTick = now;
-      void this.audio.resume();
+    } else {
+      this.closeHidden(now);
+      void this.tracker.resume();
+      // Поки сторінка спала, дедлайн міг минути (а мелодія вже грає з аудіографа).
+      this.tick();
+      this.setStatus({ screenOffMin: this.screenOffMin(now) }, true);
     }
   };
 

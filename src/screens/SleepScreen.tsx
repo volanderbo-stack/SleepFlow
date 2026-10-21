@@ -4,6 +4,7 @@ import { idealBedtime } from '../analysis/idealBedtime';
 import { fmtClock, fmtDuration, fmtTime } from '../app/format';
 import { SoundsSheet, minutesLeft, useSounds } from '../components/SoundsSheet';
 import { useNow } from '../app/hooks';
+import { isIOS } from '../app/platform';
 import { nextAlarmTs, useApp } from '../app/store';
 import { BellIcon, MoonIcon, WavesIcon } from '../components/Icons';
 import { TagPicker } from '../components/TagPicker';
@@ -45,7 +46,7 @@ export function SleepScreen() {
           <MoonIcon size={40} />
           <span>{starting ? uk.night.starting : uk.sleep.start}</span>
         </button>
-        <p className="hint center">{uk.night.prepHint}</p>
+        <p className="hint center">{isIOS() ? uk.night.prepHintIOS : uk.night.prepHint}</p>
         {tonight.alarmOn && <p className="muted center">{uk.sleep.sleepFor(fmtDuration((alarmTs - now) / 60_000))}</p>}
         <div className="pills">
           <a href="#/stats" className={`pill${debt.debtMin >= 60 ? ' pill--warn' : ''}`}>

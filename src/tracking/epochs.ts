@@ -117,7 +117,8 @@ export class EpochAggregator {
     const soundScore = Math.min(1, (b.eventFrames / b.frames) * 3);
 
     let motion = soundScore;
-    if (this.hasAccel) {
+    // З вимкненим екраном Android не віддає датчики — такі епохи оцінюємо лише за звуком.
+    if (this.hasAccel && b.accelDeltas.length > 0) {
       const thr = this.accelThreshold ?? Math.max(MIN_ACCEL_THRESHOLD, (median(this.calibAccel) ?? 0) * 4);
       const raw = b.accelDeltas.reduce((s, d) => s + Math.max(0, d - thr), 0);
       const accelScore = 1 - Math.exp(-raw / ACCEL_SCALE);
