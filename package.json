@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite --host",
     "build": "tsc --noEmit && vite build",
+    "build:pages": "tsc --noEmit && vite build --mode pages",
     "dev:https": "vite --host --mode https",
     "preview": "vite preview --host",
     "test": "vitest run",

@@ -14,6 +14,19 @@ npm test          # юніт-тести (Vitest)
 npm run icons     # перегенерувати PNG-іконки в public/icons
 ```
 
+## Публікація на GitHub Pages і встановлення на телефон
+
+Кожен push у `main` збирає застосунок і публікує його через GitHub Actions (`.github/workflows/deploy.yml`).
+
+1. Одноразово: **Settings → Pages → Build and deployment → Source: «GitHub Actions»**.
+2. Після зеленого прогону у вкладці **Actions** застосунок доступний за адресою
+   https://volanderbo-stack.github.io/SleepFlow/
+3. Встановлення:
+   - **Android (Chrome):** меню ⋮ → «Встановити застосунок» / «Додати на головний екран».
+   - **iPhone (Safari):** «Поділитися» → «На екран Додому».
+
+Локальна перевірка збірки для Pages: `npm run build:pages`, потім `npx vite preview --mode pages` → http://localhost:4173/SleepFlow/
+
 ## Структура
 
 - `src/analysis/` — чисті функції: метрики ночі, Sleep Score, класифікація стадій, гіпнограма
